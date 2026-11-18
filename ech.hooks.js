@@ -1,8 +1,8 @@
 // The sidecar's keeper, as magpie's asynchronous request hook.
 //
 // The hooks run in Bun, in the plugin host, where a process can be
-// started: the Encrypted Client Hello needs Go's crypto/tls, so the
-// sidecar is a program of its own. This hook starts it and keeps it up.
+// started: the sidecar resolves upstream addresses over encrypted DNS
+// and forwards the requests. This hook starts it and keeps it up.
 //
 // The loader of an account writes the upstreams down for the sidecar to
 // read, and the first request brings the sidecar up; if it died, this

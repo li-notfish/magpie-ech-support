@@ -17,8 +17,7 @@ const NPMS = {
 }
 
 // LIST_WAIT is how long a listing may take. The first one gives the sidecar
-// time to resolve the upstream's ECH config over DoH, fall back to the
-// built-in config, and retry with plain TLS when the edge rejects that config.
+// time to resolve the upstream's address over DoH and connect to it.
 // Magpie gives a provider's model list 20 seconds, so this fetch gives up
 // first and the listing keeps the models it had instead of the host reporting
 // a plugin that finished late.

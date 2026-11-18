@@ -1,133 +1,96 @@
 # magpie-ech-middleware
 
-Encrypted Client Hello (ECH) for [magpie](https://usemagpie.ai), as a
-provider and a sidecar.
+DNS over HTTPS (DoH) for [magpie](https://usemagpie.ai). The sidecar resolves
+upstream A/AAAA addresses through encrypted DNS, connects to the returned IPs,
+and forwards requests with normal TLS.
 
-A network that blocks a domain by its TLS SNI cannot read the name inside
-an Encrypted Client Hello, so a connection that carries one goes through.
-With this package installed, magpie has one more provider, named **ECH**:
-it is signed in to the way a provider of your own is, with the address of
-the upstream and its key, and its traffic goes out through the sidecar,
-which makes the connection with an Encrypted Client Hello and forwards it
-to the vendor.
+DoH encrypts DNS queries. Optional ECH support encrypts TLS SNI only when the
+upstream's own HTTPS record publishes a valid configuration. Historical package
+names and the `ech` provider ID remain for compatibility.
 
-## What it does
-
-- **The provider plugin** (`ech.plugin.js`) declares this ECH provider.
-  Signing in asks for three things: the address of the upstream (its
-  base URL), the kind of API the upstream speaks (Chat Completions,
-  Responses, Anthropic Messages, Gemini), and the upstream's key. The
-  models it lists are the upstream's own, asked for through the sidecar,
-and each carries the levels of thought (low, medium, high, xhigh, max) an
-agent may ask it at.
-- **The sidecar** (`sidecar/`) is a small Go program: it resolves each
-  upstream's ECH configuration over DoH, connects with an Encrypted
-  Client Hello, and forwards the requests. When the resolvers give no
-  configuration, it falls back to a built-in Cloudflare one for upstreams
-  behind Cloudflare.
-- **The hooks** (`ech.hooks.js`) run in Bun, in magpie's plugin host,
-  where a process can be started: they bring the sidecar up and keep it
-  there.
-
-## Install
-
-### 1. Add the plugin
+## Install and sign in
 
 ```sh
 magpie plugin add github:li-notfish/magpie-ech-middleware
 ```
 
-### 2. Sign in
+Go to Settings → Providers → **DoH** → sign in with the upstream HTTPS base URL,
+API kind, and API key. Sign in again to add another upstream or key. Model routes
+keep the compatible ID: `ech/<model>`. Chat Completions, Responses, Anthropic
+Messages, Gemini, and streaming responses are supported.
 
-Settings → Providers → ECH → sign in:
-
-| Asked | Given |
-| --- | --- |
-| Base URL | the address of the upstream, with its version path, like `https://api.example.com/v1` |
-| API | the kind of API the upstream speaks |
-| API key | the upstream's key |
-
-### 3. Use it
-
-An agent asks for `ech/<model>`, and the models are the ones the upstream
-lists. The requests go out through the sidecar: what the network sees is
-the cover name, not the vendor's.
-
-## More than one upstream
-
-A provider can be signed in to more than once: sign in again with another
-address and key, and that is another upstream. Two keys of the same vendor
-are fine. Each account serves the models it lists itself.
+To change an account, use its **Edit** button in the provider editor. The saved
+address and API kind are prefilled. Leave the API key blank to keep it, or enter
+a new key to replace it; no new login is needed. Saving affects only that
+account. This requires a magpie version that supports editable plugin accounts.
 
 ## Options
 
-All of them are the plugin's own, in `plugins.json`:
-`magpie plugin options <name> '<json>'`.
+Set plugin options with `magpie plugin options <name> '<json>'`:
 
-| Option | Default | What it does |
+| Option | Default | Purpose |
 | --- | --- | --- |
-| `port` | `8790` | which port the sidecar listens on |
-| `doh` | `""` | the DoH endpoints asked for the upstream's HTTPS record, comma separated; empty uses the built-in list |
-| `echFallback` | `""` | the ECH config offered when DoH gives none: `cloudflare`, `always`, `off`, or a base64 `ECHConfigList` |
+| `port` | `8790` | Local sidecar port |
+| `doh` | `""` | Custom DoH endpoints, comma-separated; empty uses built-ins |
+| `ech` | `false` | Discover ECH from the upstream's HTTPS record and use it when available |
 
-The options are read when the plugin is loaded: when plugins.json changes,
-magpie loads the plugin again.
-
-## DoH resolvers
-
-The sidecar first reads the `ech` configuration from the upstream's HTTPS
-record. It asks all of these DoH endpoints by default:
+The default resolvers are queried concurrently; the first valid answer wins:
 
 ```text
-https://dns.alidns.com/resolve
 https://223.5.5.5/resolve
-https://doh.pub/dns-query
-https://dns.google/resolve
-https://cloudflare-dns.com/dns-query
+https://1.12.12.12/dns-query
 ```
 
-To use your own resolvers, set the `doh` option, with the addresses
-separated by commas:
+Their IP addresses avoid a bootstrap system DNS query for the resolver itself.
+
+Use your own service:
+
+```sh
+magpie plugin options magpie-ech-middleware '{"doh":"https://doh.pub/dns-query"}'
+```
+
+Multiple comma-separated addresses **replace**, rather than extend, the built-in
+list:
 
 ```sh
 magpie plugin options magpie-ech-middleware '{"doh":"https://doh.pub/dns-query,https://dns.alidns.com/dns-query"}'
 ```
 
-The value **replaces** the built-in list instead of adding to it. Both the
-JSON form of DoH (such as `https://dns.alidns.com/resolve`) and the RFC 8484
-wire form (such as `https://doh.pub/dns-query`) are supported. The address
-has to be the endpoint that actually answers the query.
+JSON DoH and RFC 8484 wire format are supported. Supply the complete query URL.
+HTTPS is supported; HTTP is intended only for local or test resolvers because it
+does not encrypt DNS. The system DNS may resolve a custom resolver's own hostname
+to connect to it, but every **upstream** hostname is resolved exclusively through
+DoH. Restart magpie after changing the endpoints.
 
-`doh` only decides where the ECH configuration is looked up; it does not
-provide one. Alidns and DNSPod are DNS hosts: they do not publish a general
-ECH configuration for a domain. The configuration is published per domain
-by the CDN or edge that serves the traffic, and the sidecar uses what it
-finds.
+## Optional ECH
 
-The DoH endpoints are read when the sidecar starts; restart magpie after
-changing the option.
-
-## What a request goes through
-
-1. The plugin is loaded: every upstream that is signed in to is written
-   down for the sidecar to serve; listing the models or the first request
-   brings it up.
-2. An agent asks for `ech/<model>`. magpie routes it to the ECH provider,
-   whose loader says the base is
-   `http://127.0.0.1:8790/<the upstream's name>`.
-3. The sidecar connects to the address the sign-in named with an
-   Encrypted Client Hello: what the network sees is the cover name, not
-   the vendor's.
-4. The request reaches the vendor, and the answer comes back the way it
-   went.
-
-## Which upstreams the sidecar serves
-
-The plugin writes them into its own folder, in magpie's directory:
-
+```sh
+magpie plugin options magpie-ech-middleware '{"ech":true}'
 ```
-<magpie's directory>/magpie-ech-middleware/upstreams.json
-```
+
+With `ech` enabled, the sidecar also queries the upstream's HTTPS (type 65)
+record. It uses only the `ech` configuration actually published there; there is
+no fixed Cloudflare configuration or provider-name guessing. Missing records or
+failed discovery use ordinary TLS. If a published configuration is rejected, the
+sidecar retries only with a new configuration supplied by the server and never
+silently downgrades that connection to plaintext SNI.
+
+Set `ech` back to `false` for DoH-only operation. Changing `doh` or `ech` requires
+a magpie restart so the sidecar is restarted with the new flags.
+
+## Request flow
+
+1. The plugin writes signed-in upstreams to
+   `<magpie directory>/magpie-ech-middleware/upstreams.json`.
+2. A model listing or first request starts the sidecar.
+3. The sidecar concurrently asks DoH for A and AAAA records and caches successful
+   answers.
+4. It connects to a returned IP and performs TLS with the original hostname.
+   With `ech` enabled and a published configuration, TLS 1.3 ECH encrypts SNI;
+   otherwise it performs an ordinary TLS handshake.
+5. It forwards the request, including streaming responses.
+
+The upstream file stays simple:
 
 ```json
 {
@@ -135,150 +98,43 @@ The plugin writes them into its own folder, in magpie's directory:
 }
 ```
 
-Each name is one address a sign-in named. The sidecar watches this file
-and reads it again when it changes: an upstream signed in to later is
-served without the sidecar being started again.
+Legacy `{ "url": "...", "ech": "..." }` values are read by URL only. The `ech`
+setting is ignored and removed the next time the account is written. The
+`echFallback` option, `ECH_SIDECAR_ECH_FALLBACK`, and
+`ECH_SIDECAR_ALLOW_PLAIN` are no longer used. HTTP Host, TLS SNI, and certificate
+verification retain the original upstream hostname.
 
-An upstream that publishes no ECH configuration can be given one by hand:
-
-```json
-{
-  "api-example-com-v1-9f86d081": { "url": "https://api.example.com/v1", "ech": "<base64 ECHConfigList>" }
-}
-```
-
-## ECH fallback
-
-Some networks block DoH or strip the `ech` parameter from the HTTPS
-record. When every resolver answers without an ECH configuration, the
-sidecar falls back to a built-in configuration of Cloudflare's edge (cover
-name `cloudflare-ech.com`). The built-in one is only used for an upstream
-whose address is in Cloudflare's own networks: another server would answer
-under the cover name, and the handshake would fail.
-
-The lookup is bounded: every resolver is asked at once and given five
-seconds, so a network that blocks some of them does not spend the model
-list's whole 20-second budget before the fallback is tried. A handshake
-made with the built-in config is bounded too; when that config is rejected
-or the retry the edge offers does not complete, the connection goes on with
-plain TLS.
-
-The built-in config is a guess, because not every zone behind Cloudflare has
-ECH enabled. When the edge rejects it without offering another config, the
-sidecar retries that connection with plain TLS, so an upstream that does not
-enable ECH stays usable. Only this built-in guess may end in plain TLS: a
-config from DoH or supplied in `upstreams.json` is not silently downgraded.
-If you would rather fail than connect without ECH, turn the fallback off.
-
-- `ECH_SIDECAR_ECH_FALLBACK=off` (or `-ech-fallback ""`) turns it off.
-- `ECH_SIDECAR_ECH_FALLBACK=<base64 ECHConfigList>` (or
-  `-ech-fallback <base64>`) uses a configuration of your own for every
-  upstream.
-- `ECH_SIDECAR_ECH_FALLBACK=cloudflare` (the default) keeps the built-in
-  one.
-- `ECH_SIDECAR_ECH_FALLBACK=always` uses the built-in one for every
-  upstream, even when its address cannot be seen to be Cloudflare's.
-- An `ech` value in `upstreams.json` still wins over all of them.
-
-`cloudflare` is the only named built-in config. DoH resolvers and the ECH
-fallback are two different things: `doh` decides where a configuration is
-looked up, and `echFallback` decides what is used when none is found. The
-Alidns and DNSPod DoH endpoints can be named in `doh`, but they are not
-built-in ECH configurations. A config of another edge's own can be put in
-`upstreams.json` for that upstream, or passed as base64 through
-`echFallback` when one config fits every upstream.
-
-The flag wins over the environment variable; both win over the built-in
-default. The plugin's `echFallback` option is that flag: what it names is
-passed to the sidecar as `-ech-fallback`, so it wins over the environment
-variable too; leave it empty and the environment variable and the built-in
-default decide. The sidecar reads it when it starts: after changing it,
-restart magpie.
-
-## Running the sidecar on its own
-
-The sidecar is a program of its own, and can be run by hand:
+## Running the sidecar directly
 
 ```sh
-ech-sidecar.exe -upstreams-file upstreams.json -listen 127.0.0.1:8790 \
-  [-doh "https://doh.pub/dns-query,https://dns.alidns.com/dns-query"] \
-  [-ech-fallback cloudflare]
-# the one the plugin downloaded, the one in sidecar/bin/, or one on the PATH
+ech-sidecar.exe -upstreams-file upstreams.json -listen 127.0.0.1:8790 `
+  -doh "https://doh.pub/dns-query" [-ech]
 ```
 
-Once it is listening, it writes one line of JSON to its stdout:
+Omit `-doh` to use the built-in resolvers. `/_ech/health` is the retained
+compatibility health-check path and does not contact an upstream.
 
-```json
-{"ok":true,"port":8790,"upstreams":{"api-example-com-v1-9f86d081":{"url":"https://api.example.com/v1","ech":false,"cover":""}}}
-```
-
-That line says it is listening. The ECH configuration is looked up after,
-in the background, so `ech` is false and `cover` is empty in it: it is a
-signal that it is ready, not the conclusion of a handshake. `/_ech/health`
-answers with the state of this moment, without touching the vendor:
-
-```json
-{"ok":true,"upstreams":{"api-example-com-v1-9f86d081":{"url":"https://api.example.com/v1","ech":true,"cover":"example.com"}}}
-```
-
-`ech` says whether a configuration list is in use, and `cover` is the name
-the outer hello carries — the name the network sees.
-
-A request is served by the upstream its path names:
-`/<the upstream's name>/chat/completions` goes to that upstream, under the
-address it has.
-
-The repository carries no binaries. They are the assets of the
-[sidecar release](https://github.com/li-notfish/magpie-ech-middleware/releases/tag/sidecar),
-one per platform and architecture, so installing the package is enough and
-needs no Go: the first time the sidecar is needed, its binary is downloaded
-into the plugin's own folder in magpie's directory, under a folder named for
-this package's version, and kept there. An upgrade downloads the binary of
-its own version instead of running the one left by the version before:
-
-| Platform | Asset |
-| --- | --- |
-| Windows x64 / arm64 | `ech-sidecar-win32-x64.exe`, `ech-sidecar-win32-arm64.exe` |
-| Linux x64 / arm64 | `ech-sidecar-linux-x64`, `ech-sidecar-linux-arm64` |
-| macOS x64 / arm64 | `ech-sidecar-darwin-x64`, `ech-sidecar-darwin-arm64` |
-
-A change under `sidecar/` must bump the package's `version`: the downloaded
-binary is kept under a folder named for it, so a machine that already has
-the same version keeps the binary it downloaded before.
-
-A binary put by hand in `sidecar/bin/<platform>-<arch>/`, or named by
-`ECH_SIDECAR_PATH`, is used before any download. A platform the release
-covers no asset of has the Go source beside it: when the machine has Go
-1.26 or newer (the first `crypto/tls` that speaks Encrypted Client Hello),
-the package builds it:
+The sidecar is downloaded per package version from the
+[sidecar release](https://github.com/li-notfish/magpie-ech-middleware/releases/tag/sidecar).
+Set `ECH_SIDECAR_PATH` to use your own binary, or place one in
+`sidecar/bin/<platform>-<arch>/`. To build from source, use Go 1.26 or newer:
 
 ```sh
 npm run build
 ```
 
-## When something is wrong
+Increment `package.json`'s `version` after changing `sidecar/` so existing
+installations download the new binary.
 
-- **The models do not list** — the address is not right, the sidecar is
-  not up, or the upstream has no endpoint that lists models: the models
-  stay as they were, and magpie's log says so. A sign-in of an earlier
-  version names no address: sign in again. The plugin gives the first
-  listing 18 seconds, inside magpie's 20-second budget; when the sidecar is
-  still downloading or resolving its config, the models stay as they were
-  and the next listing uses the sidecar that is up by then.
-- **An upstream publishes no ECH configuration** — no HTTPS record, or
-  none with `ech` in it: an upstream behind Cloudflare gets the built-in
-  fallback; any other one can be given a configuration by hand in
-  upstreams.json (see above), or with the `echFallback` option when one
-  configuration fits every upstream.
-- **DoH finds nothing** — the current network may block the built-in
-  resolvers, or the record may have no `ech` in it: name a DoH endpoint that
-  works on this network in the `doh` option, and restart magpie. DNSPod's
-  `https://doh.pub/dns-query` and Alidns' `https://dns.alidns.com/dns-query`
-  can both be given directly.
-- **In a hurry, and this one connection may go in the clear** — set
-  `ECH_SIDECAR_ALLOW_PLAIN=1` and restart magpie: an upstream no ECH
-  configuration is found for goes out without one.
-- **The sidecar does not start** — when its binary could not be downloaded
-  (no release asset for this platform, or no network), run `npm run build`
-  on a machine with Go first, or put one in `sidecar/bin/` by hand; when
-  the port is taken, give another in the options.
+## Troubleshooting
+
+- **No models**: check the upstream address, API kind, key, and models endpoint;
+  sign in again if an old account lacks an address.
+- **ECH is unavailable**: enable `ech` and check that the upstream's HTTPS record
+  actually contains `ech`; an orange cloud alone does not supply the client configuration.
+- **DoH resolution fails**: check the full DoH URL and connectivity, or clear
+  `doh` and restart to restore built-ins.
+- **TLS certificate errors**: certificate verification stays enabled; check the
+  upstream hostname and certificate.
+- **The sidecar does not start**: check the local port, set `ECH_SIDECAR_PATH`,
+  or run `npm run build`.

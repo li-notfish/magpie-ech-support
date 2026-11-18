@@ -1,347 +1,263 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"net/url"
+	"net"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
-	"unicode"
+	"time"
 )
 
-// httpsRecord is the RR type of the HTTPS record (RFC 9460).
-const httpsRecord = 65
-
-// echQuoted finds the ech parameter in the presentation form of an HTTPS
-// record: ech="<base64>". The quotes are part of the format, because the
-// value is not an alphanumeric token.
-var echQuoted = regexp.MustCompile(`ech="([^"]*)"`)
-
-// echBare is the same without the quotes, for a resolver that prints the
-// value bare.
-var echBare = regexp.MustCompile(`ech=([A-Za-z0-9+/=]+)`)
-
-// dohAnswer is the part of a DoH answer in JSON form that is read here.
-type dohAnswer struct {
-	Status int `json:"Status"`
-	Answer []struct {
-		Name string `json:"name"`
-		Type int    `json:"type"`
-		Data string `json:"data"`
-	} `json:"Answer"`
+type echAnswer struct {
+	list    []byte
+	expires time.Time
+	err     error
 }
 
-// errJSONDoH says the endpoint did not answer the JSON form of DoH, so
-// the RFC 8484 wire form is worth asking for.
-var errJSONDoH = errors.New("the endpoint does not answer the JSON form of DoH")
+type echClient struct {
+	mu       sync.Mutex
+	host     string
+	resolver *dohResolver
+	config   *tls.Config
+	list     []byte
+}
 
-// maxDoHBody bounds one DoH answer.
-const maxDoHBody = 1 << 20
+var (
+	echQuoted = regexp.MustCompile(`(?:^|\s)ech="([^"]+)"`)
+	echBare   = regexp.MustCompile(`(?:^|\s)ech=([A-Za-z0-9+/=]+)`)
+)
 
-// echConfigList is the config list for the host: the one given on the
-// command line, or the one the host's HTTPS record carries.
-func echConfigList(ctx context.Context, host, given string, endpoints []string) ([]byte, error) {
-	if given != "" {
-		list, err := base64.StdEncoding.DecodeString(given)
-		if err != nil {
-			return nil, fmt.Errorf("the ECH config given is not base64: %w", err)
+func newECHClient(host string, resolver *dohResolver, config *tls.Config) *echClient {
+	return &echClient{host: host, resolver: resolver, config: config}
+}
+
+func (u *upstream) echEnabled() bool {
+	return u.ech != nil
+}
+
+// dialTLS uses ordinary TLS until this hostname actually publishes an ECH
+// configuration. A failed or missing discovery never invents a configuration.
+func (c *echClient) dialTLS(ctx context.Context, dialer *net.Dialer, network, addr string) (net.Conn, error) {
+	list := c.configList(ctx)
+	if len(list) == 0 {
+		return c.handshake(ctx, dialer, network, addr, nil)
+	}
+	var last error
+	for range 3 {
+		conn, err := c.handshake(ctx, dialer, network, addr, list)
+		if err == nil {
+			return conn, nil
 		}
-		if len(list) == 0 {
-			return nil, fmt.Errorf("the ECH config given is empty")
+		last = err
+		var rejected *tls.ECHRejectionError
+		if !errors.As(err, &rejected) || len(rejected.RetryConfigList) == 0 {
+			return nil, fmt.Errorf("the server rejected the published ECH configuration of %s: %w", c.host, err)
 		}
-		return list, nil
+		list = append([]byte(nil), rejected.RetryConfigList...)
+		c.remember(list)
+		log.Printf("ECH for %s uses the configuration returned by the server", c.host)
 	}
+	return nil, last
+}
 
-	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("no DoH endpoint given")
+func (c *echClient) handshake(ctx context.Context, dialer *net.Dialer, network, addr string, list []byte) (net.Conn, error) {
+	conn, err := c.resolver.dialContext(ctx, dialer, network, addr)
+	if err != nil {
+		return nil, err
 	}
+	config := c.config.Clone()
+	if len(list) > 0 {
+		config.MinVersion = tls.VersionTLS13
+		config.MaxVersion = tls.VersionTLS13
+		config.EncryptedClientHelloConfigList = list
+	}
+	tlsConn := tls.Client(conn, config)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
 
-	// The endpoints are asked at once, and the first answer with a config
-	// list wins: from a network that blocks some of them, waiting for each
-	// in turn can take longer than the whole lookup is given.
-	type answer struct {
-		list []byte
-		err  error
+func (c *echClient) configList(ctx context.Context) []byte {
+	c.mu.Lock()
+	list := c.list
+	c.mu.Unlock()
+	if len(list) > 0 {
+		return list
 	}
-	answers := make(chan answer, len(endpoints))
+	ctx, cancel := context.WithTimeout(ctx, dohWait)
+	defer cancel()
+	list, _, err := c.resolver.lookupECH(ctx, c.host)
+	if err != nil {
+		log.Printf("ECH is unavailable for %s; using ordinary TLS: %v", c.host, err)
+	} else if len(list) > 0 {
+		log.Printf("ECH for %s uses the configuration published in its HTTPS record", c.host)
+	}
+	c.mu.Lock()
+	c.list = list
+	c.mu.Unlock()
+	return list
+}
+
+func (c *echClient) remember(list []byte) {
+	c.mu.Lock()
+	c.list = append([]byte(nil), list...)
+	c.mu.Unlock()
+}
+
+func (r *dohResolver) lookupECH(ctx context.Context, host string) ([]byte, time.Duration, error) {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if net.ParseIP(host) != nil {
+		return nil, 0, errors.New("an IP address has no DNS ECH configuration")
+	}
+	r.mu.Lock()
+	cached, ok := r.echCache[host]
+	r.mu.Unlock()
+	if ok && time.Now().Before(cached.expires) {
+		return append([]byte(nil), cached.list...), time.Until(cached.expires), cached.err
+	}
+	answers := make(chan echAnswer, len(r.endpoints))
 	var wg sync.WaitGroup
-	for _, endpoint := range endpoints {
+	for _, endpoint := range r.endpoints {
 		wg.Add(1)
-		go func(endpoint string) {
+		go func() {
 			defer wg.Done()
-			list, err := echFromDoH(ctx, endpoint, host)
+			list, ttl, err := r.queryECH(ctx, endpoint, host)
 			if err != nil {
-				log.Printf("%s could not give the ECH config of %s: %v", endpoint, host, err)
+				log.Printf("%s could not discover ECH for %s: %v", endpoint, host, err)
 			}
-			answers <- answer{list: list, err: err}
-		}(endpoint)
+			answers <- echAnswer{list: list, expires: time.Now().Add(ttl), err: err}
+		}()
 	}
 	go func() {
 		wg.Wait()
 		close(answers)
 	}()
 	var last error
-	for a := range answers {
-		if a.err == nil {
-			return a.list, nil
+	var selected echAnswer
+	for answer := range answers {
+		if answer.err == nil && len(answer.list) > 0 {
+			selected = answer
+			break
 		}
-		last = a.err
+		last = answer.err
 	}
-	if last == nil {
-		last = fmt.Errorf("no resolver answered")
+	if len(selected.list) == 0 {
+		if last == nil {
+			last = errors.New("no resolver answered")
+		}
+		selected = echAnswer{expires: time.Now().Add(minimumTTL), err: last}
+	} else if time.Until(selected.expires) <= 0 {
+		selected.expires = time.Now().Add(minimumTTL)
 	}
-	return nil, last
+	r.mu.Lock()
+	r.echCache[host] = selected
+	r.mu.Unlock()
+	return selected.list, time.Until(selected.expires), selected.err
 }
 
-// dohEndpoints reads what the option says: one or more HTTP endpoints,
-// separated by commas or whitespace.
-func dohEndpoints(value string) ([]string, error) {
-	fields := strings.FieldsFunc(value, func(r rune) bool {
-		return r == ',' || unicode.IsSpace(r)
-	})
-	if len(fields) == 0 {
-		return nil, errors.New("no DoH endpoint given")
+func echValue(data string) ([]byte, error) {
+	match := echQuoted.FindStringSubmatch(data)
+	if match == nil {
+		match = echBare.FindStringSubmatch(data)
 	}
-	endpoints := make([]string, 0, len(fields))
-	seen := map[string]bool{}
-	for _, endpoint := range fields {
-		parsed, err := url.Parse(endpoint)
+	if match == nil {
+		return nil, nil
+	}
+	list, err := base64.StdEncoding.DecodeString(match[1])
+	if err != nil {
+		list, err = base64.RawStdEncoding.DecodeString(match[1])
+	}
+	if err != nil {
+		return nil, fmt.Errorf("the published ECH configuration is not base64: %w", err)
+	}
+	if len(list) == 0 {
+		return nil, errors.New("the published ECH configuration is empty")
+	}
+	return list, nil
+}
+
+func echFromDNSMessage(message []byte, id uint16) ([]byte, time.Duration, error) {
+	if len(message) < 12 {
+		return nil, 0, errors.New("the DNS answer is shorter than its header")
+	}
+	if got := uint16(message[0])<<8 | uint16(message[1]); got != id {
+		return nil, 0, errors.New("the DNS answer has another query id")
+	}
+	flags := uint16(message[2])<<8 | uint16(message[3])
+	if flags&0x8000 == 0 || flags&0x0200 != 0 || flags&0x000f != 0 {
+		return nil, 0, errors.New("the DNS answer is not a complete successful response")
+	}
+	questions := int(message[4])<<8 | int(message[5])
+	answers := int(message[6])<<8 | int(message[7])
+	offset := 12
+	for range questions {
+		next, err := skipDNSName(message, offset)
 		if err != nil {
-			return nil, fmt.Errorf("the DoH endpoint %q is not an HTTP URL", endpoint)
+			return nil, 0, err
 		}
-		scheme := strings.ToLower(parsed.Scheme)
-		if parsed.Host == "" || (scheme != "http" && scheme != "https") {
-			return nil, fmt.Errorf("the DoH endpoint %q is not an HTTP URL", endpoint)
+		if next+4 > len(message) {
+			return nil, 0, errors.New("the DNS question is cut short")
 		}
-		parsed.Scheme = scheme
-		endpoint = parsed.String()
-		if seen[endpoint] {
-			continue
-		}
-		seen[endpoint] = true
-		endpoints = append(endpoints, endpoint)
+		offset = next + 4
 	}
-	return endpoints, nil
-}
-
-// echFromDoH asks one resolver for the host's HTTPS record and takes the ECH
-// config list out of it. JSON DoH comes first; when the endpoint does not
-// speak it, the same URL is asked again in the RFC 8484 wire form.
-func echFromDoH(ctx context.Context, endpoint, host string) ([]byte, error) {
-	list, err := echFromJSONDoH(ctx, endpoint, host)
-	if err == nil {
-		return list, nil
-	}
-	if !errors.Is(err, errJSONDoH) {
-		return nil, err
-	}
-	list, wireErr := echFromWireDoH(ctx, endpoint, host)
-	if wireErr == nil {
-		return list, nil
-	}
-	return nil, fmt.Errorf("the JSON form failed: %v; the RFC 8484 form failed: %w", err, wireErr)
-}
-
-// dohJSONURL puts the HTTPS question into an endpoint's query string.
-func dohJSONURL(endpoint, host string) (string, error) {
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		return "", err
-	}
-	query := parsed.Query()
-	query.Set("name", host)
-	query.Set("type", strconv.Itoa(httpsRecord))
-	parsed.RawQuery = query.Encode()
-	return parsed.String(), nil
-}
-
-// echFromJSONDoH asks one resolver for the JSON form of the host's HTTPS
-// record and takes the ECH config list out of it.
-func echFromJSONDoH(ctx context.Context, endpoint, host string) ([]byte, error) {
-	target, err := dohJSONURL(endpoint, host)
-	if err != nil {
-		return nil, err
-	}
-
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("accept", "application/dns-json")
-
-	// A resolver has the same short budget as the lookup: one that has
-	// not answered by then is not going to make the first listing in time.
-	client := &http.Client{Timeout: dohWait}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		if jsonDoHUnsupported(response.StatusCode) {
-			return nil, fmt.Errorf("%w: it answered HTTP %d", errJSONDoH, response.StatusCode)
-		}
-		return nil, fmt.Errorf("answered HTTP %d", response.StatusCode)
-	}
-
-	body, err := readDoHBody(response.Body)
-	if err != nil {
-		return nil, err
-	}
-	var answer dohAnswer
-	if err := json.Unmarshal(body, &answer); err != nil {
-		return nil, fmt.Errorf("%w: the answer is not JSON: %v", errJSONDoH, err)
-	}
-	if answer.Status != 0 {
-		return nil, fmt.Errorf("the resolver answered with DNS status %d", answer.Status)
-	}
-	for _, record := range answer.Answer {
-		if record.Type != httpsRecord {
-			continue
-		}
-		encoded := echValue(record.Data)
-		if encoded == "" {
-			continue
-		}
-		list, err := base64.StdEncoding.DecodeString(encoded)
+	for range answers {
+		next, err := skipDNSName(message, offset)
 		if err != nil {
-			return nil, fmt.Errorf("the ech parameter is not base64: %w", err)
+			return nil, 0, err
 		}
-		if len(list) == 0 {
-			continue
+		offset = next
+		if offset+10 > len(message) {
+			return nil, 0, errors.New("the DNS record is cut short")
 		}
-		return list, nil
-	}
-	return nil, fmt.Errorf("the HTTPS record of %s carries no ech parameter", host)
-}
-
-// jsonDoHUnsupported says whether an HTTP status is one an endpoint that
-// speaks only the wire form may give to the JSON question.
-func jsonDoHUnsupported(status int) bool {
-	switch status {
-	case http.StatusBadRequest, http.StatusNotFound, http.StatusMethodNotAllowed,
-		http.StatusNotAcceptable, http.StatusUnsupportedMediaType, http.StatusNotImplemented:
-		return true
-	}
-	return false
-}
-
-// echFromWireDoH asks one resolver with an RFC 8484 DNS message and takes
-// the ECH config list out of the wire answer.
-func echFromWireDoH(ctx context.Context, endpoint, host string) ([]byte, error) {
-	query, id, err := dnsQuery(host)
-	if err != nil {
-		return nil, err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(query))
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("content-type", "application/dns-message")
-	request.Header.Set("accept", "application/dns-message")
-
-	client := &http.Client{Timeout: dohWait}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("answered HTTP %d", response.StatusCode)
-	}
-	body, err := readDoHBody(response.Body)
-	if err != nil {
-		return nil, err
-	}
-	return echFromDNSMessage(body, id)
-}
-
-// readDoHBody reads one answer, and refuses one that is too large.
-func readDoHBody(body io.Reader) ([]byte, error) {
-	value, err := io.ReadAll(io.LimitReader(body, maxDoHBody+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(value) > maxDoHBody {
-		return nil, fmt.Errorf("the DoH answer is larger than %d bytes", maxDoHBody)
-	}
-	return value, nil
-}
-
-// echValue is the base64 config list in the presentation form of an HTTPS
-// record.
-func echValue(data string) string {
-	if match := echQuoted.FindStringSubmatch(data); match != nil {
-		return match[1]
-	}
-	if match := echBare.FindStringSubmatch(data); match != nil {
-		return match[1]
-	}
-	return ""
-}
-
-// coverName is the public name the first config of the list names: the name
-// the outer hello carries, the one a network sees.
-func coverName(list []byte) string {
-	if len(list) < 2 {
-		return ""
-	}
-	// The list is a length and the configs. Each config is a version, a
-	// length and the payload the version names.
-	body := list[2:]
-	for len(body) >= 4 {
-		size := int(body[2])<<8 | int(body[3])
-		if size < 4 || 4+size > len(body) {
-			return ""
+		kind := uint16(message[offset])<<8 | uint16(message[offset+1])
+		class := uint16(message[offset+2])<<8 | uint16(message[offset+3])
+		ttl := time.Duration(uint32(message[offset+4])<<24|uint32(message[offset+5])<<16|uint32(message[offset+6])<<8|uint32(message[offset+7])) * time.Second
+		size := int(message[offset+8])<<8 | int(message[offset+9])
+		offset += 10
+		if offset+size > len(message) {
+			return nil, 0, errors.New("the DNS record is cut short")
 		}
-		payload := body[4 : 4+size]
-		body = body[4+size:]
-		if name, ok := publicName(payload); ok {
-			return name
+		if kind == dnsHTTPS && class == 1 {
+			list := echFromSVCBRData(message, offset, offset+size)
+			if len(list) > 0 {
+				return append([]byte(nil), list...), ttl, nil
+			}
 		}
+		offset += size
 	}
-	return ""
+	return nil, 0, errors.New("the HTTPS record carries no ECH configuration")
 }
 
-// publicName is the name the payload of a config carries.
-func publicName(payload []byte) (string, bool) {
-	// The payload is a config id, a key exchange method, the public key,
-	// the cipher suites, the longest name the server takes, the public
-	// name itself and the extensions.
-	if len(payload) < 4 {
-		return "", false
+func echFromSVCBRData(message []byte, start, end int) []byte {
+	if start+2 > end {
+		return nil
 	}
-	offset := 3
-	if offset+2 > len(payload) {
-		return "", false
+	offset, err := skipDNSName(message, start+2)
+	if err != nil || offset > end {
+		return nil
 	}
-	keyLength := int(payload[offset])<<8 | int(payload[offset+1])
-	offset += 2 + keyLength
-	if offset+2 > len(payload) {
-		return "", false
+	for offset < end {
+		if offset+4 > end {
+			return nil
+		}
+		key := uint16(message[offset])<<8 | uint16(message[offset+1])
+		size := int(message[offset+2])<<8 | int(message[offset+3])
+		offset += 4
+		if offset+size > end {
+			return nil
+		}
+		if key == 5 && size > 0 {
+			return message[offset : offset+size]
+		}
+		offset += size
 	}
-	suiteLength := int(payload[offset])<<8 | int(payload[offset+1])
-	offset += 2 + suiteLength
-	if offset+1 > len(payload) {
-		return "", false
-	}
-	offset++ // the longest name the server takes
-	if offset+1 > len(payload) {
-		return "", false
-	}
-	nameLength := int(payload[offset])
-	offset++
-	if offset+nameLength > len(payload) {
-		return "", false
-	}
-	return string(payload[offset : offset+nameLength]), true
+	return nil
 }

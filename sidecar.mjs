@@ -2,8 +2,7 @@
 // it is asked whether it is up.
 //
 // This file runs in Bun, in magpie's plugin host, where a process can be
-// started: the Encrypted Client Hello needs Go's crypto/tls, so the
-// sidecar is a program of its own.
+// started: the sidecar handles DoH resolution, optional ECH, and connections.
 //
 // The sidecar's binaries are published as the assets of the repository's
 // sidecar release, one per platform and architecture, so the repository
@@ -25,15 +24,14 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import http from "node:http"
 import { delimiter, dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { dohOf, echFallbackOf, portOf } from "./ech.shared.js"
+import { dohOf, echOf, portOf } from "./ech.shared.js"
 
 // Where the package sits, and where the sidecar is looked for.
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SIDECAR_DIR = join(HERE, "sidecar")
 
 // SIDECAR_WAIT is how long the sidecar may take to say which port it
-// took. It resolves the upstream's ECH config over DoH first, which is
-// what takes the time.
+// took. It writes the listening address before resolving any upstream.
 const SIDECAR_WAIT = 30000
 
 // RETRY is how long the keeper waits before it tries to start the
@@ -92,8 +90,7 @@ export function upstreamFile(directory = configDirectory) {
 // setUpstream writes one upstream down for the sidecar to serve: the
 // name an account's address is served under, and the address itself.
 //
-// What the file says beside it is kept: the other accounts' upstreams,
-// and an ECH config given by hand for an upstream that publishes none.
+// Other accounts' upstreams are kept; an obsolete ECH setting is dropped.
 export function setUpstream(directory, id, address) {
   configDirectory = directory
   const file = upstreamFile(directory)
@@ -104,7 +101,7 @@ export function setUpstream(directory, id, address) {
     was = {}
   }
   const had = was && typeof was === "object" ? was[id] : undefined
-  const said = had && typeof had === "object" && typeof had.url === "string" ? { ...had, url: address } : address
+  const said = address
   const out = { ...(was && typeof was === "object" ? was : {}), [id]: said }
   try {
     mkdirSync(dirname(file), { recursive: true })
@@ -206,7 +203,7 @@ export async function downloadSidecar(directory = configDirectory, url = release
 
 // findGo is the Go toolchain: the one in GOROOT, the usual install
 // places, or the one on the PATH. The sidecar needs Go 1.26 or newer, the
-// first release whose crypto/tls speaks Encrypted Client Hello.
+// release supported by the Go module.
 export function findGo() {
   const name = process.platform === "win32" ? "go.exe" : "go"
   const dirs = (process.env.PATH ?? "").split(delimiter)
@@ -247,9 +244,7 @@ export function buildSidecar(spawnImpl = spawn, go = findGo()) {
     proc.stderr?.setEncoding?.("utf8")
     proc.stderr?.on("data", (chunk) => {
       err += chunk
-      // The sidecar's own lines are worth seeing: the cover name its
-      // ECH config uses, and a request that failed, are the only word on
-      // what the connection is like. They go to the host's log.
+      // Resolver and upstream failures go to the host's log.
       process.stderr.write(chunk)
     })
     proc.on("error", (error) => {
@@ -266,25 +261,20 @@ export function buildSidecar(spawnImpl = spawn, go = findGo()) {
 }
 
 // sidecarArgs are the flags the sidecar is started with: the file it
-// reads its upstreams from, the address it listens on, what the user
-// says about going on without an ECH config, the ECH fallback when the
-// options name one, and the DoH endpoints when they name those. Without
-// a fallback, the sidecar's own -ech-fallback and
-// ECH_SIDECAR_ECH_FALLBACK decide; without DoH endpoints, its own
-// default resolvers do.
-export function sidecarArgs(file, listen = "", fallback = "", doh = "") {
+// reads its upstreams from, the address it listens on, the DoH endpoints,
+// and whether published ECH configurations should be used.
+export function sidecarArgs(file, listen = "", doh = "", ech = false) {
   if (!file) throw new Error(NO_UPSTREAMS)
   const args = ["-upstreams-file", file]
   if (listen) args.push("-listen", listen)
   if (doh) args.push("-doh", doh)
-  if (fallback) args.push("-ech-fallback", fallback)
-  if (process.env.ECH_SIDECAR_ALLOW_PLAIN === "1") args.push("-allow-plain")
+  if (ech) args.push("-ech")
   return args
 }
 
 // startSidecar runs the sidecar and waits for the port it took. The
 // sidecar writes one JSON line to its stdout when it is ready.
-export function startSidecar(spawnImpl = spawn, path = "", file = "", listen = "", fallback = "", doh = "") {
+export function startSidecar(spawnImpl = spawn, path = "", file = "", listen = "", doh = "", ech = false) {
   if (!file) return Promise.reject(new Error(NO_UPSTREAMS))
   const binary = findSidecar(path)
   return new Promise((resolve, reject) => {
@@ -299,7 +289,7 @@ export function startSidecar(spawnImpl = spawn, path = "", file = "", listen = "
     }
     let proc
     try {
-      proc = spawnImpl(binary, sidecarArgs(file, listen, fallback, doh), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
+      proc = spawnImpl(binary, sidecarArgs(file, listen, doh, ech), { stdio: ["ignore", "pipe", "pipe"], windowsHide: true })
     } catch (error) {
       reject(new Error(`the sidecar could not be started: ${error?.message ?? error}`))
       return
@@ -414,8 +404,7 @@ export async function ensureSidecar(options = {}) {
 }
 
 // upstreamAddress is the address a health answer or a wanted upstream
-// names: some of the latter are objects with an ECH config beside the
-// address.
+// names. Legacy objects with an ECH setting are read as their URL.
 function upstreamAddress(value) {
   if (typeof value === "string") return value
   if (value && typeof value === "object" && typeof value.url === "string") return value.url
@@ -450,8 +439,8 @@ export async function start(options = {}) {
   const file = upstreamFile(configDirectory)
   const port = portOf(o)
   const listen = `127.0.0.1:${port}`
-  const fallback = echFallbackOf(o)
   const doh = dohOf(o)
+  const ech = echOf(o)
 
   // The check is given the time the caller has: the gateway hook that
   // starts the sidecar has a second of its own, and the check must not
@@ -473,7 +462,7 @@ export async function start(options = {}) {
     const got = await downloadSidecar(configDirectory)
     if (got) binary = got
   }
-  const { child } = await startSidecar(spawn, binary, file, listen, fallback, doh)
+  const { child } = await startSidecar(spawn, binary, file, listen, doh, ech)
   running.add(child)
   child?.once?.("exit", () => {
     running.delete(child)

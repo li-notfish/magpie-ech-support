@@ -63,14 +63,12 @@ describe("setUpstream", () => {
     expect(said).toEqual(wrote)
   })
 
-  test("keeps the ECH config given by hand for an upstream", () => {
+  test("drops an obsolete ECH setting from an existing upstream", () => {
     const dir = tempDir()
     const file = upstreamFile(dir)
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, JSON.stringify({ nvidia: { url: "https://old.example.com/v1", ech: "Y2VjaA==" } }))
-    const wrote = setUpstream(dir, "nvidia", "https://new.example.com/v1")
-    expect(wrote.nvidia.url).toBe("https://new.example.com/v1")
-    expect(wrote.nvidia.ech).toBe("Y2VjaA==")
+    expect(setUpstream(dir, "nvidia", "https://new.example.com/v1").nvidia).toBe("https://new.example.com/v1")
   })
 
   test("answers the upstreams the sidecar is to serve", () => {
@@ -86,7 +84,7 @@ describe("servesUpstreams", () => {
     expect(servesUpstreams(said, { nvidia: "https://api.example.com/v1" })).toBe(true)
   })
 
-  test("is so when a wanted upstream carries its ECH config too", () => {
+  test("accepts a legacy upstream object by its URL", () => {
     const said = { upstreams: { nvidia: { url: "https://api.example.com/v1" } } }
     const want = { nvidia: { url: "https://api.example.com/v1", ech: "a config given by hand" } }
     expect(servesUpstreams(said, want)).toBe(true)
@@ -194,19 +192,18 @@ describe("sidecarArgs", () => {
     ])
   })
 
-  test("carry the ECH fallback the options name", () => {
-    expect(sidecarArgs("C:/magpie/upstreams.json", "127.0.0.1:8790", "always")).toEqual([
+  test("enable ECH discovery only when the option asks for it", () => {
+    expect(sidecarArgs("C:/magpie/upstreams.json", "127.0.0.1:8790", "", true)).toEqual([
       "-upstreams-file",
       "C:/magpie/upstreams.json",
       "-listen",
       "127.0.0.1:8790",
-      "-ech-fallback",
-      "always",
+      "-ech",
     ])
   })
 
   test("carry the DoH endpoints the options name", () => {
-    expect(sidecarArgs("C:/magpie/upstreams.json", "127.0.0.1:8790", "", "https://doh.pub/dns-query")).toEqual([
+    expect(sidecarArgs("C:/magpie/upstreams.json", "127.0.0.1:8790", "https://doh.pub/dns-query")).toEqual([
       "-upstreams-file",
       "C:/magpie/upstreams.json",
       "-listen",
@@ -216,8 +213,8 @@ describe("sidecarArgs", () => {
     ])
   })
 
-  test("leave the fallback to the sidecar when the options name none", () => {
-    expect(sidecarArgs("C:/magpie/upstreams.json", "127.0.0.1:8790", "")).toEqual([
+  test("leave the built-in resolvers in charge when no endpoints are set", () => {
+    expect(sidecarArgs("C:/magpie/upstreams.json", "127.0.0.1:8790")).toEqual([
       "-upstreams-file",
       "C:/magpie/upstreams.json",
       "-listen",

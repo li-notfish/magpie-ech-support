@@ -1,6 +1,6 @@
 // The provider side of this package: one provider of the user's own,
 // signed in to with the address of an upstream and its key, whose
-// traffic goes out with an Encrypted Client Hello.
+// traffic uses DoH and, when enabled and published, ECH.
 //
 // The plugin runs in Bun, in magpie's plugin host. It declares one
 // provider, "ech". Signing in to it asks for the address of the
@@ -9,8 +9,8 @@
 // signed in to more than once (two keys of the same vendor, say): the
 // provider can be signed in to as many times as the user likes.
 //
-// The provider's loader sends the requests to the sidecar, which makes
-// the connection with an Encrypted Client Hello and forwards them to the
+// The provider's loader sends the requests to the sidecar, which resolves
+// the upstream over DoH and forwards them to the
 // address the sign-in named. Its models are the ones the upstream lists,
 // asked through the sidecar as well.
 //
@@ -19,7 +19,7 @@
 // be one.
 import { ensureSidecar, setUpstream } from "./sidecar.mjs"
 import { KINDS, addressOf, kindOf, listedOf, slugOf, validateAddress } from "./ech.providers.js"
-import { dohOf, echFallbackOf, portOf } from "./ech.shared.js"
+import { dohOf, portOf } from "./ech.shared.js"
 
 // PROVIDER is the provider this package serves. Its models come from the
 // upstream each account is signed in to, so none are declared here.
@@ -27,7 +27,7 @@ const PROVIDER = "ech"
 
 // MODELS_WAIT is what magpie gives a provider's model list. The plugin
 // answers within it even when the sidecar's binary is still being downloaded
-// or the first ECH lookup is slow: the listing keeps the models it had
+// or the first DoH lookup is slow: the listing keeps the models it had
 // instead of the host reporting that the plugin finished late.
 const MODELS_WAIT = 18000
 
@@ -49,14 +49,14 @@ function within(promise, ms, value) {
 export const ech = async (input, options) => {
   const directory = typeof input?.directory === "string" ? input.directory : ""
   const port = portOf(options)
-  const fallback = echFallbackOf(options)
   const doh = dohOf(options)
+  const ech = options?.ech === true
 
   return {
     config: async (cfg) => {
       cfg.provider ??= {}
       cfg.provider[PROVIDER] ??= {
-        name: "ECH",
+        name: "DoH",
         npm: "@ai-sdk/openai-compatible",
         api: `http://127.0.0.1:${port}`,
         models: {},
@@ -69,6 +69,7 @@ export const ech = async (input, options) => {
         {
           type: "api",
           label: "API key",
+          editable: true,
           prompts: [
             {
               type: "text",
@@ -127,7 +128,7 @@ export const ech = async (input, options) => {
         // here, the way the loader writes it for its requests.
         const began = Date.now()
         setUpstream(directory, slugOf(address), address)
-        const up = await within(ensureSidecar({ directory, port, echFallback: fallback, doh }), START_WAIT, false)
+        const up = await within(ensureSidecar({ directory, port, doh, ech }), START_WAIT, false)
         if (!up) {
           console.error("[ech] the sidecar is not up yet, so the models stay as they were")
           return known

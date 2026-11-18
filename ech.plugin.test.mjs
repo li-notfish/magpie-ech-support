@@ -7,7 +7,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { ech } from "./ech.plugin.js"
 import { addressOf, kindOf, listedOf, slugOf, validateAddress } from "./ech.providers.js"
-import { dohOf, echFallbackOf, portOf } from "./ech.shared.js"
+import { dohOf, echOf, portOf } from "./ech.shared.js"
 import { upstreamFile } from "./sidecar.mjs"
 
 const temps = []
@@ -41,7 +41,7 @@ describe("the provider the plugin declares", () => {
     const plugin = await pluginOf()
     const cfg = {}
     await plugin.config(cfg)
-    expect(cfg.provider.ech.name).toBe("ECH")
+    expect(cfg.provider.ech.name).toBe("DoH")
     expect(cfg.provider.ech.npm).toBe("@ai-sdk/openai-compatible")
     expect(cfg.provider.ech.models).toEqual({})
   })
@@ -60,6 +60,7 @@ describe("the sign-in the plugin asks for", () => {
     expect(plugin.auth.provider).toBe("ech")
     const method = plugin.auth.methods[0]
     expect(method.type).toBe("api")
+    expect(method.editable).toBe(true)
     expect(method.prompts.map((p) => p.key)).toEqual(["baseURL", "kind", "key"])
     expect(typeof method.authorize).toBe("function")
   })
@@ -313,13 +314,12 @@ describe("the helpers", () => {
     expect(portOf({ port: 70000 })).toBe(8790)
   })
 
-  test("the ECH fallback is the one the user set", () => {
-    expect(echFallbackOf({ echFallback: " always " })).toBe("always")
-    expect(echFallbackOf({ echFallback: "AEX+DQBB" })).toBe("AEX+DQBB")
-    expect(echFallbackOf({})).toBe("")
-    expect(echFallbackOf({ echFallback: "  " })).toBe("")
-    expect(echFallbackOf(null)).toBe("")
-    expect(echFallbackOf({ echFallback: 8790 })).toBe("")
+  test("ECH is opt-in", () => {
+    expect(echOf({ ech: true })).toBe(true)
+    expect(echOf({ ech: false })).toBe(false)
+    expect(echOf({})).toBe(false)
+    expect(echOf({ ech: "true" })).toBe(false)
+    expect(echOf(null)).toBe(false)
   })
 
   test("the DoH endpoints are the ones the user set", () => {
