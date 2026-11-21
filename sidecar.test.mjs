@@ -1,6 +1,6 @@
 // The keeper's own tests: where the sidecar is, what it is to serve,
 // and how it is asked whether it is up.
-import { afterAll, describe, expect, test } from "bun:test"
+import { afterAll, describe, expect, spyOn, test } from "bun:test"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import http from "node:http"
 import { tmpdir } from "node:os"
@@ -161,8 +161,16 @@ describe("the sidecar's binary", () => {
 
   test("is not downloaded when the release says nothing", async () => {
     const dir = tempDir()
-    const got = await downloadSidecar(dir, "https://example.com/none", async () => ({ ok: false }))
-    expect(got).toBeNull()
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      const got = await downloadSidecar(dir, "https://example.com/none", async () => ({ ok: false, status: 503 }))
+      expect(got).toBeNull()
+      expect(errors.mock.calls.flat().join(" ")).toContain("HTTP 503")
+      expect(await downloadSidecar(dir, "https://example.com/none", async () => { throw new Error("connection refused") })).toBeNull()
+      expect(errors.mock.calls.flat().join(" ")).toContain("connection refused")
+    } finally {
+      errors.mockRestore()
+    }
   })
 
   test("is named in the release's address", () => {

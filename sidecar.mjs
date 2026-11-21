@@ -181,12 +181,19 @@ export async function downloadSidecar(directory = configDirectory, url = release
   let said
   try {
     said = await fetchImpl(url, { signal: AbortSignal.timeout(DOWNLOAD_WAIT), redirect: "follow" })
-  } catch {
+  } catch (error) {
+    console.error(`[ech] the sidecar's binary could not be downloaded: ${error?.message ?? error}`)
     return null
   }
-  if (!said?.ok) return null
+  if (!said?.ok) {
+    console.error(`[ech] the sidecar's binary could not be downloaded: HTTP ${said?.status ?? "unknown"}`)
+    return null
+  }
   const bytes = Buffer.from(await said.arrayBuffer())
-  if (!bytes.length) return null
+  if (!bytes.length) {
+    console.error("[ech] the sidecar's binary could not be downloaded: the answer was empty")
+    return null
+  }
   try {
     mkdirSync(dir, { recursive: true })
     const tmp = join(dir, `${sidecarName()}.part`)
@@ -433,7 +440,7 @@ export async function start(options = {}) {
   if (typeof o.directory === "string" && o.directory) configDirectory = o.directory
   const names = Object.keys(wanted)
   if (!names.length) {
-    console.error(`[ech] ${NO_UPSTREAMS}`)
+    console.log(`[ech] ${NO_UPSTREAMS}`)
     return false
   }
   const file = upstreamFile(configDirectory)

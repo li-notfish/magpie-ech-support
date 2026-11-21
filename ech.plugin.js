@@ -31,10 +31,12 @@ const PROVIDER = "ech"
 // instead of the host reporting that the plugin finished late.
 const MODELS_WAIT = 18000
 
-// START_WAIT is how much of that budget bringing the sidecar up may take. A
-// download that takes longer goes on in the background; the next listing
-// finds it done.
-const START_WAIT = 6000
+// START_WAIT leaves time for the listing when the sidecar takes a while.
+const START_WAIT = 15000
+
+// MIN_LIST_WAIT is the least a listing or its one retry gets.
+const MIN_LIST_WAIT = 3000
+const RETRY_WAIT = 500
 
 // within answers the value when the promise has not settled in time. The
 // promise goes on, so a sidecar that is still starting is kept.
@@ -46,11 +48,24 @@ function within(promise, ms, value) {
   return Promise.race([promise, late]).finally(() => clearTimeout(timer))
 }
 
-export const ech = async (input, options) => {
+export const ech = async (input, options, internals = {}) => {
   const directory = typeof input?.directory === "string" ? input.directory : ""
   const port = portOf(options)
   const doh = dohOf(options)
   const ech = options?.ech === true
+  let starting
+  const sidecar = () => {
+    starting ??= Promise.resolve(internals.ensureSidecar?.({ directory, port, doh, ech }) ?? ensureSidecar({ directory, port, doh, ech }))
+      .then((ready) => {
+        if (!ready) starting = undefined
+        return ready
+      })
+      .catch(() => {
+        starting = undefined
+        return false
+      })
+    return starting
+  }
 
   return {
     config: async (cfg) => {
@@ -126,30 +141,41 @@ export const ech = async (input, options) => {
         // The listing is what brings the sidecar up, and a loader runs
         // for a request, not for a listing: the upstream is written down
         // here, the way the loader writes it for its requests.
-        const began = Date.now()
+        const began = internals.now?.() ?? Date.now()
         setUpstream(directory, slugOf(address), address)
-        const up = await within(ensureSidecar({ directory, port, doh, ech }), START_WAIT, false)
+        console.log("[ech] waiting for the sidecar before listing models")
+        const up = await within(sidecar(), internals.startWait ?? START_WAIT, false)
         if (!up) {
-          console.error("[ech] the sidecar is not up yet, so the models stay as they were")
+          console.error("[ech] the sidecar was not ready within 15s; its startup continues in the background, so the models stay as they were")
           return known
         }
-        const left = MODELS_WAIT - (Date.now() - began)
-        if (left < 1000) {
-          console.error("[ech] the sidecar took too long to come up, so the models stay as they were")
-          return known
+        console.log(`[ech] the sidecar is ready after ${(internals.now?.() ?? Date.now()) - began}ms`)
+        let failure
+        const totalWait = internals.modelsWait ?? MODELS_WAIT
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          const left = totalWait - ((internals.now?.() ?? Date.now()) - began)
+          if (left < MIN_LIST_WAIT) break
+          failure = {}
+          const said = await (internals.listedOf ?? listedOf)(
+            kindOf(auth.metadata),
+            address,
+            typeof auth.key === "string" ? auth.key : "",
+            port,
+            left,
+            failure,
+          )
+          if (said) {
+            console.log(`[ech] the models of ${address} were listed after ${(internals.now?.() ?? Date.now()) - began}ms`)
+            return said
+          }
+          console.error(`[ech] the models of ${address} could not be listed: ${failure.reason ?? "unknown error"}`)
+          const remaining = totalWait - ((internals.now?.() ?? Date.now()) - began) - RETRY_WAIT
+          if (attempt === 2 || !failure.retry || remaining < MIN_LIST_WAIT) break
+          console.log(`[ech] trying the model listing again in ${RETRY_WAIT}ms`)
+          await (internals.delay?.(RETRY_WAIT) ?? new Promise((resolve) => setTimeout(resolve, RETRY_WAIT)))
         }
-        const said = await listedOf(
-          kindOf(auth.metadata),
-          address,
-          typeof auth.key === "string" ? auth.key : "",
-          port,
-          left,
-        )
-        if (!said) {
-          console.error(`[ech] the models of ${address} could not be listed; the ones known stay`)
-          return known
-        }
-        return said
+        console.error(`[ech] the models of ${address} could not be listed after ${(internals.now?.() ?? Date.now()) - began}ms; the ones known stay`)
+        return known
       },
     },
   }

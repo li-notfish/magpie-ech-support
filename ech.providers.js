@@ -111,7 +111,7 @@ function variantsOf(kind) {
 // its own: magpie keeps a list per account, so the ids of two upstreams
 // never meet, and a model is named ech/<the id, and nothing more>. It
 // answers null when the upstream said nothing.
-export async function listedOf(kind, address, key, port, wait = LIST_WAIT) {
+export async function listedOf(kind, address, key, port, wait = LIST_WAIT, details) {
   const slug = slugOf(address)
   if (!slug) return null
   const base = `http://127.0.0.1:${port}/${slug}`
@@ -122,11 +122,14 @@ export async function listedOf(kind, address, key, port, wait = LIST_WAIT) {
   const waitMs = Number.isFinite(wait) && wait > 0 ? wait : LIST_WAIT
   const said =
     kind === "gemini"
-      ? geminiOf(await getOf(`${base}${under}/models?key=${encodeURIComponent(key)}`, {}, waitMs))
+      ? geminiOf(await getOf(`${base}${under}/models?key=${encodeURIComponent(key)}`, {}, waitMs, details))
       : openaiOf(
-          await getOf(`${base}${under}/models`, kind === "anthropic" ? anthropicHeaders(key) : bearerHeaders(key), waitMs),
+          await getOf(`${base}${under}/models`, kind === "anthropic" ? anthropicHeaders(key) : bearerHeaders(key), waitMs, details),
         )
-  if (!said) return null
+  if (!said) {
+    if (details && typeof details === "object") details.reason ??= "the answer named no models"
+    return null
+  }
   const variants = variantsOf(kind)
   const out = {}
   for (const m of said) {
@@ -163,17 +166,28 @@ function anthropicHeaders(key) {
 
 // getOf asks one address and answers its JSON, or null when it said
 // nothing of the kind. It waits a while, no longer.
-async function getOf(url, headers = {}, wait = LIST_WAIT) {
+async function getOf(url, headers = {}, wait = LIST_WAIT, details) {
   let said
   try {
     said = await fetch(url, { headers, signal: AbortSignal.timeout(wait) })
-  } catch {
+  } catch (error) {
+    if (!details || typeof details !== "object") return null
+    details.retry = true
+    details.reason = error?.name === "TimeoutError" ? `the request timed out after ${wait}ms` : `the connection failed: ${error?.message ?? error}`
     return null
   }
-  if (!said.ok) return null
+  if (!said.ok) {
+    if (details && typeof details === "object") {
+      details.status = said.status
+      details.retry = [502, 503, 504].includes(said.status)
+      details.reason = `the upstream answered HTTP ${said.status}`
+    }
+    return null
+  }
   try {
     return await said.json()
   } catch {
+    if (details && typeof details === "object") details.reason = "the answer was not valid JSON"
     return null
   }
 }

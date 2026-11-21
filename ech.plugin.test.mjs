@@ -1,6 +1,6 @@
 // The plugin's own tests: the provider it declares, the sign-in it asks
 // for, and the loader and models each account has.
-import { afterAll, describe, expect, test } from "bun:test"
+import { afterAll, describe, expect, spyOn, test } from "bun:test"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import http from "node:http"
 import { tmpdir } from "node:os"
@@ -259,6 +259,132 @@ describe("the models of an account", () => {
         },
       })
     } finally {
+      server.close()
+    }
+  })
+
+  test("wait past the old startup limit and retry a temporary failure", async () => {
+    const address = "https://api.example.com/v1"
+    let now = 0
+    let ready
+    let starts = 0
+    let listings = 0
+    const starting = new Promise((resolve) => { ready = resolve })
+    const internals = {
+      now: () => now,
+      ensureSidecar: () => { starts++; return starting },
+      listedOf: async (kind, base, key, port, wait, failure) => {
+        listings++
+        if (listings === 1) Object.assign(failure, { retry: true, reason: "HTTP 503" })
+        return listings === 2 ? { "gpt-4o": { name: "gpt-4o" } } : null
+      },
+      delay: async () => { now += 500 },
+    }
+    const plugin = await ech({ directory: tempDir() }, { port: 8790 }, internals)
+    const known = { old: { name: "old" } }
+    const auth = { type: "api", key: "sk-secret", metadata: { baseURL: address, kind: "chat" } }
+    const pending = plugin.provider.models({ models: known }, { auth })
+    now = 6500
+    ready(true)
+    const said = await pending
+    expect(said["gpt-4o"]).toBeDefined()
+    expect(starts).toBe(1)
+    expect(listings).toBe(2)
+    expect(now).toBe(7000)
+  })
+
+  test("share a slow startup and keep the old models when it exceeds the budget", async () => {
+    let now = 0
+    let ready
+    let starts = 0
+    let listings = 0
+    const starting = new Promise((resolve) => { ready = resolve })
+    const plugin = await ech({ directory: tempDir() }, {}, {
+      now: () => now,
+      startWait: 50,
+      modelsWait: 60,
+      ensureSidecar: () => { starts++; return starting },
+      listedOf: async () => { listings++; return {} },
+    })
+    const known = { old: { name: "old" } }
+    const auth = { type: "api", key: "sk-secret", metadata: { baseURL: "https://api.example.com/v1" } }
+    const one = plugin.provider.models({ models: known }, { auth })
+    now = 49
+    const two = plugin.provider.models({ models: known }, { auth })
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    now = 51
+    try {
+      expect(await one).toBe(known)
+      expect(await two).toBe(known)
+      expect(starts).toBe(1)
+      expect(listings).toBe(0)
+      ready(true)
+      expect(errors.mock.calls.flat().join(" ")).not.toContain("sk-secret")
+    } finally {
+      errors.mockRestore()
+    }
+  })
+
+  test("do not retry invalid data or non-retryable statuses", async () => {
+    const plugin = await ech({ directory: tempDir() }, {}, {
+      ensureSidecar: async () => true,
+      listedOf: async (kind, address, key, port, wait, failure) => {
+        Object.assign(failure, { retry: false, status: 401, reason: "HTTP 401" })
+        return null
+      },
+    })
+    const known = { old: { name: "old" } }
+    expect(await plugin.provider.models({ models: known }, {
+      auth: { type: "api", key: "sk-secret", metadata: { baseURL: "https://api.example.com/v1" } },
+    })).toBe(known)
+  })
+
+  test("report timeout, connection and HTTP failures without keys", async () => {
+    const address = "https://api.example.com/v1"
+    const slug = slugOf(address)
+    const failures = []
+    const statuses = [503, 401, 200]
+    const server = http.createServer((req, res) => {
+      if (req.url === `/${slug}/models`) {
+        const status = statuses.shift()
+        if (status === 200) {
+          res.writeHead(status, { "content-type": "application/json" })
+          res.end("not JSON")
+          return
+        }
+        res.writeHead(status, { "content-type": "application/json" })
+        res.end(status === 200 ? "not JSON" : "")
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    await new Promise((done) => server.listen(0, "127.0.0.1", done))
+    const errors = spyOn(console, "error").mockImplementation(() => {})
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const details = {}
+        expect(await listedOf("chat", address, "sk-secret", server.address().port, 100, details)).toBeNull()
+        failures.push(details)
+      }
+      const quiet = http.createServer(() => {})
+      await new Promise((done) => quiet.listen(0, "127.0.0.1", done))
+      const timeout = {}
+      try {
+        expect(await listedOf("chat", address, "sk-secret", quiet.address().port, 10, timeout)).toBeNull()
+      } finally {
+        quiet.closeAllConnections()
+        quiet.close()
+      }
+      failures.push(timeout)
+      expect(failures[0].retry).toBe(true)
+      expect(failures[0].status).toBe(503)
+      expect(failures[1].retry).toBe(false)
+      expect(failures[2].reason).toContain("JSON")
+      expect(failures[3].reason).toContain("timed out")
+      expect(errors.mock.calls.flat().join(" ")).not.toContain("sk-secret")
+    } finally {
+      errors.mockRestore()
       server.close()
     }
   })
